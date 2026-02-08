@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Data pipeline with DynamoDB, Glue, and scheduled Lambda
+
+
+Parameters:
+  ApplicationId:
+    Type: String
+    Default: essmdatalake
+
+  ProjectName:
+    Type: String
+    Default: cc
+    Description: cc short for customconnector
+
+  ProjectId:
+    Type: String
+    Default: customconnector
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, uat, prod]
+
+  PlatformName:
+    Type: String
+    Description: SaaS platform name (e.g. eloqua, wrike)
+    Default: wrike
+
+  DataBucketName:
+    Type: String
+    Description: S3 bucket for the data
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+
+  GlueNumberOfWorkers:
+    Type: Number
+    Default: 2
+
+  GlueMaxRetries:
+    Type: Number
+    Default: 0
+
+  GlueTimeout:
+    Type: Number
+    Default: 2880
+
+  NotificationRecipients:
+    Type: String
+    Default: Praveen.Lakshmana@verisk.com
+
+  ETLJobTriggerCronExpression:
+    Type: String
+    Default: cron(15 11 * * ? *)
+
+  DataLayerType:
+    Type: String
+    Default: staging
+
+Resources:
+  GlueETLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluerole-iam-${Environment}"
+      PermissionsBoundary: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/VA-PB-Standard'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: glue.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluepolicy-iam-${Environment}"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            Resource: !Sub "arn:aws:s3:::${DataBucketName}/*"
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${DataBucketName}"
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            Resource: 
+            # Staging Tables
+            - !Sub
+              - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${HistoryTable}"
+              - HistoryTable: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-${DataLayerType}-ingestionhistory-table-${Environment}"
+            - !Sub
+              - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConfigTable}"
+              - ConfigTable: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-${DataLayerType}-config-table-${Environment}"
+            # Processed Tables
+            - !Sub
+              - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${HistoryTable}"
+              - HistoryTable: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-ingestionhistory-table-${Environment}"
+            - !Sub
+              - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ConfigTable}"
+              - ConfigTable: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-config-table-${Environment}"
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource: !Sub
+              - "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-*"
+              - SecretName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-apicredentials-sm-${Environment}"
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - glue:CreateTable
+            - glue:UpdateTable
+            - glue:GetDatabase
+            - glue:GetTable
+            - glue:DeleteTable
+            Resource:
+            - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+            - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${PlatformName}_${Environment}"
+            - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${PlatformName}_${Environment}/*"
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource: !Sub
+              - "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${FunctionName}"
+              - FunctionName: !Sub "${ApplicationId}-${ProjectName}-commonnotifier-lambda-${Environment}"
+      Tags:
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      # in "test" environment, we don't have permission for iam:TagRole so for now remove this tag and deploy
+      - Key: Environment
+        Value: !Ref Environment
+
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluejob-${Environment}"
+      Role: !GetAtt GlueETLRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${DataBucketName}/${PlatformName}/${Environment}/scripts/main.py"
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--custom-logGroup-prefix': !Sub 'aws-glue/${ApplicationId}/${ProjectName}/${PlatformName}/${Environment}'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${DataBucketName}/${PlatformName}/${Environment}/spark-logs/'
+        '--CONFIG_TABLE': !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-${DataLayerType}-config-table-${Environment}"
+        '--L2_CONFIG_TABLE': !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-config-table-${Environment}"
+        '--LOG_GROUP': !Sub "/aws-glue/${ApplicationId}/${ProjectName}/${PlatformName}/${DataLayerType}/loggroup/${Environment}"
+        '--L2_LOG_GROUP': !Sub "/aws-glue/${ApplicationId}/${ProjectName}/${PlatformName}/loggroup/${Environment}"
+        '--LOAD_TYPE': 'FULL'
+        "--customer-driver-env-vars": !Sub
+          - '${EnvironmentPair},${NotifierLambdaPair},${NotificationToPair}'
+          - EnvironmentPair: !Sub "CUSTOMER_ENVIRONMENT=${Environment}"
+            NotifierLambdaPair: !Sub "CUSTOMER_NOTIFIER_LAMBDA=${ApplicationId}-${ProjectName}-commonnotifier-lambda-${Environment}"
+            NotificationToPair: !Sub 'CUSTOMER_NOTIFICATION_TO="${NotificationRecipients}"'
+        '--SAAS_PLATFORM': 'wrike'
+        '--CUSTOM_CONFIGS': !Sub '{"spark.sql.catalog.glue_catalog.warehouse":"s3://${DataBucketName}/${PlatformName}/${Environment}/iceberg-warehouse/"}'
+        '--CUSTOM_SPARK_CONFIGS': !Sub '{"spark.sql.catalog.glue_catalog.warehouse":"s3://${DataBucketName}/${PlatformName}/${Environment}/iceberg-warehouse/"}'
+        '--additional-python-modules': 'jsonpath-ng==1.5.3,requests==2.28.1,Jinja2==3.1.4'
+        '--extra-py-files': !Sub 's3://${DataBucketName}/${PlatformName}/${Environment}/scripts/${PlatformName}_code.zip'
+      GlueVersion: '5.0'
+      MaxRetries: !Ref GlueMaxRetries
+      Timeout: !Ref GlueTimeout
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Tags:
+        "VA-ApplicationId": !Ref ApplicationId
+        "VA-ProjectId": !Ref ProjectId
+        "Application": !Ref PlatformName
+        "Environment": !Ref Environment
+
+  ETLJobTriggerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluetrigger-iam-${Environment}"
+      PermissionsBoundary: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/VA-PB-Standard'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+      - PolicyName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluetrigger-iam-${Environment}"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - glue:StartJobRun
+            Resource: !Sub
+              - "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${JobName}"
+              - JobName: !Ref GlueETLJob
+      Tags:
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      - Key: Environment
+        Value: !Ref Environment
+
+  ETLJobTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:  !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluetrigger-lambda-${Environment}"
+      Code: ./glue-etl-trigger-lambda/
+      Handler: index.lambda_handler
+      Role: !GetAtt ETLJobTriggerLambdaExecutionRole.Arn
+      Runtime: python3.13
+      Timeout: 60
+      Tags:
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      - Key: Environment
+        Value: !Ref Environment
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref GlueETLJob
+          ARG_ENV: !Ref Environment
+          ARG_REGION: !Ref AWS::Region
+          ARG_CONFIG_TABLE: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-config-table-${Environment}"
+          ARG_SAAS_PLATFORM: !Ref PlatformName
+          ARG_LOAD_TYPE: FULL
+
+  ETLJobTriggerLambdaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-gluetriggerlambda-rule-${Environment}"
+      ScheduleExpression: !Ref ETLJobTriggerCronExpression
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt ETLJobTriggerLambda.Arn
+        Id: GlueLambdaTarget
+        Input:
+          Fn::Sub: |
+            {
+              "job_args": {
+                "LOAD_TYPE": "FULL",
+                "SAAS_PLATFORM": "wrike",
+                "customer-driver-env-vars": "CUSTOMER_ENVIRONMENT=${Environment},CUSTOMER_NOTIFIER_LAMBDA=${ApplicationId}-${ProjectName}-commonnotifier-lambda-${Environment},CUSTOMER_NOTIFICATION_TO="
+              }
+            }
+      Tags:
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      - Key: Environment
+        Value: !Ref Environment
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ETLJobTriggerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ETLJobTriggerLambdaRule.Arn

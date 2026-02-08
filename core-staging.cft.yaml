@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Core Infra for SaaS Data Pipeline (DynamoDB, S3, Secrets, Logs)
+
+
+Parameters:
+  ApplicationId:
+    Type: String
+    Default: essmdatalake
+
+  ProjectName:
+    Type: String
+    Description: cc short for customconnector
+    Default: cc
+
+  ProjectId:
+    Type: String
+    Default: customconnector
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, uat, prod]
+
+  PlatformName:
+    Type: String
+    Description: SaaS platform name (e.g. eloqua, wrike)
+    Default: wrike
+
+  DataLayerType:
+    Type: String
+    Default: staging
+
+
+Resources:
+  HistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-${DataLayerType}-ingestionhistory-table-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+      - AttributeName: configId
+        AttributeType: S
+      - AttributeName: loadTimestamp
+        AttributeType: S
+      KeySchema:
+      - AttributeName: configId
+        KeyType: HASH
+      - AttributeName: loadTimestamp
+        KeyType: RANGE
+      Tags: &tags-anchor
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      - Key: Environment
+        Value: !Ref Environment
+      - Key: DataLayerType
+        Value: !Ref DataLayerType
+
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-${DataLayerType}-config-table-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+      - AttributeName: configId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: configId
+        KeyType: HASH
+      Tags: *tags-anchor
+
+  ApiSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-apicredentials-sm-${Environment}"
+      Description: SaaS Platform API credentials and configuration
+      Tags:
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      - Key: Environment
+        Value: !Ref Environment
+
+  ETLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws-glue/${ApplicationId}/${ProjectName}/${PlatformName}/${DataLayerType}/loggroup/${Environment}"
+      RetentionInDays: 30
+      Tags: *tags-anchor
+
+  ETLDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${PlatformName}_${Environment}'
+        Description: 'Database for SaaS ETL data'
+
+  L2CoreStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TimeoutInMinutes: '20'
+      TemplateURL: "core.cft.yaml"
+      Parameters:
+        Environment: !Ref Environment

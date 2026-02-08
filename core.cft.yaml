@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Core Infra for L2 Wrike Data Pipeline (DynamoDB, Logs, GlueDB)
+
+
+Parameters:
+  ApplicationId:
+    Type: String
+    Default: essmdatalake
+
+  ProjectName:
+    Type: String
+    Description: cc short for customconnector
+    Default: cc
+
+  ProjectId:
+    Type: String
+    Default: customconnector
+
+  PlatformName:
+    Type: String
+    Description: SaaS platform name (e.g. eloqua, wrike)
+    Default: wrike
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, uat, prod]
+
+  DataLayerType:
+    Type: String
+    Default: processed
+
+Resources:
+  HistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-ingestionhistory-table-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+      - AttributeName: configId
+        AttributeType: S
+      - AttributeName: loadTimestamp
+        AttributeType: S
+      KeySchema:
+      - AttributeName: configId
+        KeyType: HASH
+      - AttributeName: loadTimestamp
+        KeyType: RANGE
+      Tags: &tags-anchor
+      - Key: VA-ApplicationId
+        Value: !Ref ApplicationId
+      - Key: VA-ProjectId
+        Value: !Ref ProjectId
+      - Key: Application
+        Value: !Ref PlatformName
+      - Key: Environment
+        Value: !Ref Environment
+      - Key: DataLayerType
+        Value: !Ref DataLayerType
+
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationId}-${ProjectName}-${PlatformName}-config-table-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+      - AttributeName: configId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: configId
+        KeyType: HASH
+      Tags: *tags-anchor
+
+  ETLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws-glue/${ApplicationId}/${ProjectName}/${PlatformName}/loggroup/${Environment}"
+      RetentionInDays: 30
+      Tags: *tags-anchor
